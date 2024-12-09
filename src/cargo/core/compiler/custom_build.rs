@@ -579,7 +579,7 @@ fn build_work(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResul
         paths::write(&output_file, &output.stdout)?;
         // This mtime shift allows Cargo to detect if a source file was
         // modified in the middle of the build.
-        paths::set_file_time_no_err(output_file, timestamp);
+        paths::set_file_time_to_invocation_time(output_file, timestamp);
         paths::write(&err_file, &output.stderr)?;
         paths::write(&root_output_file, paths::path2bytes(&script_out_dir)?)?;
         let parsed_output = BuildOutput::parse(

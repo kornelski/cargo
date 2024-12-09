@@ -1863,7 +1863,7 @@ fn compare_old_fingerprint(
         // update the mtime so other cleaners know we used it
         let t = FileTime::from_system_time(SystemTime::now());
         debug!("mtime-on-use forcing {:?} to {}", old_hash_path, t);
-        paths::set_file_time_no_err(old_hash_path, t);
+        paths::set_file_time_to_invocation_time(old_hash_path, t);
     }
 
     let compare = _compare_old_fingerprint(old_hash_path, new_fingerprint);

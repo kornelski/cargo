@@ -469,7 +469,7 @@ fn rustc(
             })?;
             // This mtime shift allows Cargo to detect if a source file was
             // modified in the middle of the build.
-            paths::set_file_time_no_err(dep_info_loc, timestamp);
+            paths::set_file_time_to_invocation_time(dep_info_loc, timestamp);
         }
 
         Ok(())

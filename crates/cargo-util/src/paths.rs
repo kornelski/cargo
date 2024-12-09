@@ -689,13 +689,79 @@ pub fn copy<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> Result<u64> {
 
 /// Changes the filesystem mtime (and atime if possible) for the given file.
 ///
+/// If the filesystem can't preserve timestamps precisely, the modification time
+/// will be rounded up.
+///
 /// This intentionally does not return an error, as this is sometimes not
 /// supported on network filesystems. For the current uses in Cargo, this is a
 /// "best effort" approach, and errors shouldn't be propagated.
-pub fn set_file_time_no_err<P: AsRef<Path>>(path: P, time: FileTime) {
+pub fn set_file_time_to_invocation_time<P: AsRef<Path>>(path: P, mut time: FileTime) {
+    use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
+
+    // Timestamps may become rounded when set, even when file creation and stat have
+    // higher precision.
+    // Modification time may lose the nanoseconds part entirely, e.g.
+    // Docker + VirtioFS + Apple Virtualization Framework has this issue in macOS 15.
+    // Timestamps may also get rounded to microseconds (e.g. by APIs using `struct timeval`).
+    #[repr(u8)]
+    #[derive(Copy, Clone, PartialEq)]
+    enum MTimeSetPrecision {
+        Unknown = 0,
+        Nanoseconds = 1,
+        Microseconds = 2,
+        Seconds = 3,
+    }
+    static MTIME_SET_PRECISION: AtomicU8 = AtomicU8::new(MTimeSetPrecision::Unknown as u8);
+
+    let file_times_precision = MTIME_SET_PRECISION.load(Relaxed);
+    if time.nanoseconds() != 0 {
+        if file_times_precision == MTimeSetPrecision::Seconds as u8 {
+            // This is used to set invocation time. Rounding down (into the past) would make
+            // other, accurate timestamps appear in the future, and invalidate the build.
+            time = FileTime::from_unix_time(1 + time.unix_seconds(), 0);
+        } else if file_times_precision == MTimeSetPrecision::Microseconds as u8 {
+            let mut s = time.unix_seconds();
+            let mut ns = (time.nanoseconds() + 999) / 1000 * 1000;
+            if ns >= 1_000_000_000 {
+                ns -= 1_000_000_000;
+                s += 1;
+            }
+            time = FileTime::from_unix_time(s, ns);
+        }
+    }
+
     let path = path.as_ref();
     match filetime::set_file_times(path, time, time) {
-        Ok(()) => tracing::debug!("set file mtime {} to {}", path.display(), time),
+        Ok(()) => {
+            // more than 1 microsecond is needed to see how much rounding happens
+            if time.nanoseconds() > 1000 && file_times_precision == MTimeSetPrecision::Unknown as u8
+            {
+                // Intentionally no locking, fetch_max may race multiple checks
+                if let Ok(new_time) = mtime(path) {
+                    let detected = if new_time.nanoseconds() == time.nanoseconds() {
+                        MTimeSetPrecision::Nanoseconds
+                    } else if new_time.nanoseconds() != 0 {
+                        tracing::info!(
+                            "detected file system rounding modification time by {}ns (at {})",
+                            new_time.nanoseconds().abs_diff(time.nanoseconds()),
+                            path.display()
+                        );
+                        MTimeSetPrecision::Microseconds
+                    } else {
+                        tracing::warn!("detected file system rounding modification time to whole seconds (at {})",
+                            path.display());
+                        MTimeSetPrecision::Seconds
+                    };
+                    MTIME_SET_PRECISION.fetch_max(detected as u8, Relaxed);
+
+                    if detected != MTimeSetPrecision::Nanoseconds {
+                        // Fix the file's mtime now that the flaw is known
+                        set_file_time_to_invocation_time(path, time);
+                    }
+                }
+            }
+            tracing::debug!("set file mtime {} to {}", path.display(), time)
+        }
         Err(e) => tracing::warn!(
             "could not set mtime of {} to {}: {:?}",
             path.display(),
